@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="fil">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GPS Walk Tracker</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--tx:#f1f5f9;--mut:#94a3b8;--ac:#22c55e;--rd:#ef4444;--yl:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:system-ui,sans-serif;min-height:100vh;padding:16px;display:flex;flex-direction:column;gap:12px}
+h1{font-size:18px;text-align:center;color:var(--mut)}
+.big{background:var(--card);border-radius:16px;padding:24px;text-align:center}
+.big .num{font-size:64px;font-weight:700;color:var(--ac);line-height:1}
+.big .unit{color:var(--mut);margin-top:6px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.box{background:var(--card);border-radius:12px;padding:14px;text-align:center}
+.box b{display:block;font-size:22px}
+.box span{font-size:12px;color:var(--mut)}
+.btns{display:flex;gap:10px}
+button{flex:1;padding:16px;border:0;border-radius:12px;font-size:16px;font-weight:600;color:#fff;cursor:pointer}
+#start{background:var(--ac)}#pause{background:var(--yl);color:#000}#reset{background:var(--rd)}
+button:disabled{opacity:.4}
+#status{text-align:center;font-size:13px;color:var(--mut);min-height:18px}
+canvas{width:100%;height:220px;background:var(--card);border-radius:12px}
+</style>
+</head>
+<body>
+<h1>📍 GPS Walk Tracker</h1>
+
+<div class="big">
+  <div class="num" id="km">0.00</div>
+  <div class="unit">kilometro</div>
+</div>
+
+<div class="grid">
+  <div class="box"><b id="m">0</b><span>metro</span></div>
+  <div class="box"><b id="time">00:00:00</b><span>oras</span></div>
+  <div class="box"><b id="spd">0.0</b><span>km/h (ngayon)</span></div>
+  <div class="box"><b id="avg">0.0</b><span>km/h (average)</span></div>
+  <div class="box"><b id="steps">0</b><span>tinatayang hakbang</span></div>
+  <div class="box"><b id="acc">--</b><span>GPS accuracy (m)</span></div>
+</div>
+
+<canvas id="map"></canvas>
+
+<div class="btns">
+  <button id="start">▶ Start</button>
+  <button id="pause" disabled>⏸ Pause</button>
+  <button id="reset">↺ Reset</button>
+</div>
+<div id="status">Pindutin ang Start para magsimula.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const MAX_ACC = 25;      // ignore GPS readings worse than 25 m
+const MIN_MOVE = 3;      // ignore jitter below 3 m
+const MAX_SPEED = 12;    // m/s, ignore impossible jumps (walking/jogging)
+const STEP_LEN = 0.75;   // meters per step (estimate)
+
+let watchId = null, running = false;
+let dist = 0, last = null, path = [];
+let elapsed = 0, tStart = 0, timer = null, wakeLock = null;
+
+// Haversine distance in meters
+function haversine(a, b){
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(b.lat - a.lat), dLon = r(b.lon - a.lon);
+  const h = Math.sin(dLat/2)**2 +
+            Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function fmtTime(s){
+  s = Math.floor(s);
+  const h = String(Math.floor(s/3600)).padStart(2,'0');
+  const m = String(Math.floor(s%3600/60)).padStart(2,'0');
+  const sc = String(s%60).padStart(2,'0');
+  return `${h}:${m}:${sc}`;
+}
+
+function render(curSpeed){
+  const secs = elapsed + (running ? (Date.now() - tStart)/1000 : 0);
+  $('km').textContent = (dist/1000).toFixed(2);
+  $('m').textContent = Math.round(dist);
+  $('time').textContent = fmtTime(secs);
+  $('steps').textContent = Math.round(dist / STEP_LEN);
+  $('avg').textContent = secs > 0 ? ((dist/secs)*3.6).toFixed(1) : '0.0';
+  if (curSpeed !== undefined) $('spd').textContent = (curSpeed*3.6).toFixed(1);
+}
+
+function drawPath(){
+  const c = $('map'), dpr = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const W = c.clientWidth, H = c.clientHeight;
+  g.clearRect(0,0,W,H);
+  if (path.length < 2){
+    g.fillStyle = '#94a3b8'; g.font = '13px system-ui'; g.textAlign = 'center';
+    g.fillText('Lalabas dito ang iyong dinaanan', W/2, H/2); return;
+  }
+  let minLa=Infinity,maxLa=-Infinity,minLo=Infinity,maxLo=-Infinity;
+  path.forEach(p=>{minLa=Math.min(minLa,p.lat);maxLa=Math.max(maxLa,p.lat);
+                   minLo=Math.min(minLo,p.lon);maxLo=Math.max(maxLo,p.lon);});
+  const pad = 20, midLa = (minLa+maxLa)/2;
+  const kx = Math.cos(midLa*Math.PI/180);
+  const w = Math.max((maxLo-minLo)*kx, 1e-6), h = Math.max(maxLa-minLa, 1e-6);
+  const sc = Math.min((W-pad*2)/w, (H-pad*2)/h);
+  const ox = (W - w*sc)/2, oy = (H - h*sc)/2;
+  const X = p => ox + (p.lon-minLo)*kx*sc, Y = p => H - (oy + (p.lat-minLa)*sc);
+  g.strokeStyle = '#22c55e'; g.lineWidth = 3; g.lineJoin = 'round'; g.beginPath();
+  path.forEach((p,i)=> i ? g.lineTo(X(p),Y(p)) : g.moveTo(X(p),Y(p)));
+  g.stroke();
+  const s = path[0], e = path[path.length-1];
+  g.fillStyle = '#3b82f6'; g.beginPath(); g.arc(X(s),Y(s),6,0,7); g.fill();
+  g.fillStyle = '#ef4444'; g.beginPath(); g.arc(X(e),Y(e),6,0,7); g.fill();
+}
+
+function onPos(pos){
+  const { latitude:lat, longitude:lon, accuracy, speed } = pos.coords;
+  $('acc').textContent = Math.round(accuracy);
+  if (accuracy > MAX_ACC){ $('status').textContent = 'Mahina ang GPS signal… lumabas sa bukas na lugar.'; return; }
+  $('status').textContent = 'Nagta-track…';
+  const cur = { lat, lon, t: pos.timestamp };
+  if (last){
+    const d = haversine(last, cur);
+    const dt = (cur.t - last.t)/1000;
+    if (d >= MIN_MOVE && dt > 0 && d/dt <= MAX_SPEED){
+      dist += d; last = cur; path.push(cur); save();
+      render(speed != null ? speed : d/dt); drawPath(); return;
+    }
+    if (d < MIN_MOVE){ render(0); return; }
+    return; // unrealistic jump, ignore
+  }
+  last = cur; path.push(cur); drawPath();
+}
+
+function onErr(e){
+  const msg = {1:'Hindi pinayagan ang location permission.',2:'Hindi makuha ang location.',3:'Nag-timeout ang GPS.'};
+  $('status').textContent = '⚠ ' + (msg[e.code] || e.message);
+}
+
+async function lockScreen(){
+  try{ if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+}
+
+function start(){
+  if (!navigator.geolocation){ $('status').textContent = 'Walang GPS support ang device.'; return; }
+  running = true; tStart = Date.now();
+  watchId = navigator.geolocation.watchPosition(onPos, onErr,
+    { enableHighAccuracy:true, maximumAge:0, timeout:15000 });
+  timer = setInterval(()=>render(), 1000);
+  $('start').disabled = true; $('pause').disabled = false;
+  $('status').textContent = 'Naghahanap ng GPS signal…';
+  lockScreen();
+}
+
+function pause(){
+  if (!running) return;
+  elapsed += (Date.now() - tStart)/1000; running = false;
+  navigator.geolocation.clearWatch(watchId); clearInterval(timer);
+  last = null; // avoid counting gap while paused
+  if (wakeLock){ try{wakeLock.release();}catch(e){} wakeLock = null; }
+  $('start').disabled = false; $('start').textContent = '▶ Ituloy';
+  $('pause').disabled = true; $('spd').textContent = '0.0';
+  $('status').textContent = 'Naka-pause.'; save();
+}
+
+function reset(){
+  if (running) pause();
+  dist = 0; elapsed = 0; last = null; path = [];
+  $('start').textContent = '▶ Start'; $('acc').textContent = '--';
+  try{ localStorage.removeItem('gpsWalk'); }catch(e){}
+  render(0); drawPath(); $('status').textContent = 'Na-reset na.';
+}
+
+function save(){
+  try{ localStorage.setItem('gpsWalk', JSON.stringify({dist, elapsed: elapsed + (running ? (Date.now()-tStart)/1000 : 0), path})); }catch(e){}
+}
+function load(){
+  try{
+    const d = JSON.parse(localStorage.getItem('gpsWalk') || 'null');
+    if (d){ dist = d.dist||0; elapsed = d.elapsed||0; path = d.path||[]; if (dist>0) $('start').textContent = '▶ Ituloy'; }
+  }catch(e){}
+}
+
+document.addEventListener('visibilitychange', ()=>{ if (running && document.visibilityState==='visible') lockScreen(); });
+window.addEventListener('resize', drawPath);
+$('start').onclick = start; $('pause').onclick = pause; $('reset').onclick = reset;
+load(); render(0); drawPath();
+</script>
+</body>
+</html>
